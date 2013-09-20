@@ -1,0 +1,76 @@
+#!/usr/bin/env /siglinux/tc/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Time::localtime;
+
+my $original_file_loc;
+my $copied_file_loc;
+
+my $result = GetOptions("original_file_loc=s" 	=>\$original_file_loc,
+		  	"copied_file_loc=s"	=>\$copied_file_loc,
+			);
+
+unless (defined ($original_file_loc))
+{
+	$original_file_loc = ""; #"/nfs/infadev/IntServ_MDM_861/ParamFiles/";
+}
+
+unless (defined($copied_file_loc))
+{
+	$copied_file_loc =  ""; #"/nfs/infadev/Metadata_Mgr_Dev/ParamFiles/";
+}
+
+opendir(my $DH, $original_file_loc) or die "Error Opening Original directory $original_file_loc";
+my @files_in_org_file_loc = readdir($DH);
+closedir($DH);
+
+opendir(my $DH1, $copied_file_loc) or die "Error Opening Copied directory $copied_file_loc";
+my @files_in_cop_file_loc = readdir($DH1);
+closedir($DH1);
+
+foreach my $file (@files_in_cop_file_loc)
+{
+	my $index_of_file = &index_of($file, @files_in_org_file_loc);
+
+	if ( $index_of_file != -1)
+	{
+		my $last_mod_time_org_file = (stat( $files_in_org_file_loc[$index_of_file] ) -> mtime );
+		my $last_mod_time_cop_file = (stat( $file ) -> mtime);
+		
+		if ($last_mod_time_org_file != $last_mod_time_cop_file)
+		{	
+			my $file_to_be_copied = "$original_file_loc.$files_in_org_file_loc[$index_of_file]";
+			`cp $file_to_be_copied $copied_file_loc`;
+		}			
+	}
+}
+
+sub index_of
+{
+	my $element = $_[0];
+	my @array = $_[1];
+	my $found = 1; 
+	my $size = $#array; 
+	my $i = 0;
+	
+	while ($found == 0 and $i lt $size)
+	{
+		if($element =~ /$array[$i]/)	
+		{
+			return $i;
+		}
+		else
+		{
+			$i++;
+		}
+
+	}
+	
+	return -1;
+}
+
+
+
+
