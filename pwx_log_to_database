@@ -1,0 +1,765 @@
+#!/usr/bin/env /siglinux/tc/bin/perl
+
+########################################################################
+# File          : PWX_logs_to_database.pl
+#
+# Author        : Richa Bhartia
+# Date          : 04/16/2013
+# Description   : This script finds Informatica PowerExchange Unit of Work condenser log files
+#                 and saves specific log message information to database tables.
+#
+# Params        : Database connect string (SID).
+#             Database user name.
+#             Database user password.
+#             log directory containing PowerExchange UOW condenser log files.
+#
+# ID        : $Id: //Depot/Source/Database/pwxadmin/Main/Scripts/PWX_logs_to_database.pl#9 $ $Date: 2013/04/24 $ $Author: berthoff $
+#
+# Modification  : <name/date/description of any changes made after initial creation>
+#                  Name            Date              Description of Change
+#                  ----            ----              ---------------------
+#                  Richa Bhartia   04/16/2013        New.
+#
+#
+#
+##########################################################################################################################
+$\="\n";
+$|=1;
+use strict;
+use Getopt::Long;
+use FileHandle;
+use DBI qw(:sql_types);
+use File::stat;
+use Time::localtime;	
+#use DateTime;
+
+my $dbsource;
+my $dbname;
+my $user;
+my $password;
+my $verbose;
+my $dbh;
+my $sth;
+my @failed;
+my $message;
+my $log_directory;
+my $open_date;
+
+
+my $dbattr = {
+   AutoCommit => 0,
+   PrintError => 0,
+   RaiseError => 1,
+  };
+
+my $rslt = GetOptions("log_directory=s" => \$log_directory,
+ 		      "dbname=s" => \$dbname,
+ 		      "user=s" => \$user,
+ 		      "password=s" => \$password,
+ 		      "verbose=s" => \$verbose,
+		     );
+(defined($verbose)) and print "dbname	     :$dbname\n";
+(defined($verbose)) and print "user		     :$user\n";
+#(defined($verbose)) and print "password	     :$password\n";
+(defined($verbose)) and print "log Directory :$log_directory\n";
+
+(defined($dbname)) or die "Please specify a Database connect string (SID).";
+(defined($user)) or die "Please specify a Database user name.";
+(defined($password)) or die "Please specify the Database password.";
+(defined($log_directory)) or die "Please specify a log directory.";
+
+
+$dbsource = "DBI:Oracle:$dbname";
+(defined($verbose)) and print $dbsource;
+$dbh = DBI->connect($dbsource, $user, $password, $dbattr) or die "DBI error:" . DBI->errstr();
+(defined($verbose)) and print "\nConnection Successful\n";
+
+use constant
+{ 
+   ORACLE_LOGMINER_POLLS => "PWX-11084",	
+   ORACLE_LOGMINER_WAITS => "PWX-11085",
+   PROCESSING_SCN => "PWX-11082",
+   TIME_DIFF => "PWX-11091",
+   UNFORMATTED_LOGS => "PWX-10970",
+};
+
+#sub read_from_file; 
+opendir(my $DH, $log_directory) or die "Error opening log directory $log_directory";
+my @dir_name = split("/", $log_directory);  
+(defined($verbose)) and print "source: $dir_name[-1]";
+
+my @files_in_log_dir= readdir($DH);
+my %files_to_read = ();
+
+closedir($DH);
+foreach my $file(@files_in_log_dir) {
+   my $open_date;
+   next if($file !~ /PWXCCL.t[0-9]+.p[0-9]+.n[0-9]+.log/);
+   my $x = 0; 
+   open(FIN,'<', $log_directory.$file) or die("Couldn't open the file-@_\n");
+   while( <FIN> ) { 
+	 my $line = $_;
+	 chomp( $line );
+     my $index_val_open  = index($line, "Trace file opened");
+     if( $index_val_open != -1) {
+        $open_date = substr($line, ($index_val_open+17));
+	    $open_date =~ s/^\s+//;
+   	    $open_date =~ s/\s+$//;
+        #(defined($verbose)) and print "open_date: $open_date";
+        # stop reading after the open date found
+        last;
+     }
+   }
+   close(FIN);
+   my $returned_status = ' '; 
+   #(defined($verbose)) and print "file_name: $file";
+   #(defined($verbose)) and print "open_time: $open_date";
+   eval { 
+     $sth = $dbh->prepare( 
+     "BEGIN 
+        PKG_PWX_CONDENSE_LOG.CLOSE_PREVIOUS_LOG (
+     	                    SOURCE_NAME_IN => :source_name,
+                            FILE_NAME_IN => :file_name,
+						    OPEN_TIME_IN => :open_time); 
+	 END;");
+      $sth->bind_param( ':source_name', $dir_name[-1], { TYPE => SQL_VARCHAR });
+      $sth->bind_param( ':file_name', $file, { TYPE => SQL_VARCHAR });
+      $sth->bind_param( ':open_time', $open_date, { TYPE => SQL_VARCHAR });
+      $sth->execute( );
+   };
+   if($@) {
+       $message = "CLOSE_PREVIOUS_LOG: Errors! : $@\n";
+       print $message;
+       eval 
+       { 
+	     $dbh->rollback;
+       };
+       if( $@ ) { 
+  	      $message = "CLOSE_PREVIOUS_LOG rollback: $@\n";
+	      print $message;
+       }
+	   die;
+   } 
+   eval { 
+      $dbh->commit(); 
+   };
+   if ($@ ) { 
+         my $message = "Commit CLOSE_PREVIOUS_LOG failed: $@\n";
+	         print $message;
+	         push @failed, $message;
+	   	 eval { 
+	 	     $dbh->rollback()
+		 };
+	   	 if( $@ ) {     
+	           $message = "Rollback commit CLOSE_PREVIOUS_LOG failed: $@\n";
+	           print $message;
+	         }
+	         die;
+   }
+   eval { 
+     $sth = $dbh->prepare( 
+     "BEGIN 
+     	  :returned_status:=PKG_PWX_CONDENSE_LOG.GET_READ_STATUS(
+     	                    SOURCE_NAME_IN => :source_name,
+                            FILE_NAME_IN => :file_name,
+						    OPEN_TIME_IN => :open_time); 
+      END;");
+      $sth->bind_param( ':source_name', $dir_name[-1], { TYPE => SQL_VARCHAR });
+      $sth->bind_param( ':file_name', $file, { TYPE => SQL_VARCHAR });
+      $sth->bind_param( ':open_time', $open_date, { TYPE => SQL_VARCHAR });
+      $sth->bind_param_inout( ':returned_status', \$returned_status, 1);
+      $sth->execute( );
+   };
+   if($@) {
+       $message = "GET_READ_STATUS 1: Errors! : $@\n";
+       print $message;
+       eval 
+       { 
+	     $dbh->rollback;
+       };
+       if( $@ ) { 
+  	      $message = "GET_READ_STATUS 1 rollback: $@\n";
+	      print $message;
+       }
+	   die;
+   } 
+   #(defined($verbose)) and print "returned_status: $returned_status";
+   if ($returned_status eq 'N') {
+ 	   $files_to_read{ $file } = { 'source_name' =>  $dir_name[-1]
+ 	                             , 'open_time'   => $open_date } ;
+   }
+   #Check if file has already been read or not. Y = file has been read before, and if it is complete. 
+} 
+
+foreach my $readfile ( keys %files_to_read ) {
+   #(defined($verbose)) and print "file to read: $readfile";
+   #(defined($verbose)) and print "$files_to_read{$readfile}{'source_name'}";   
+   #(defined($verbose)) and print "$files_to_read{$readfile}{'open_time'}";   
+ 
+   my $r_id = ""; #returned id
+   eval {
+   	$sth = $dbh->prepare(
+  	     "BEGIN 
+     	      :r_id:=PKG_PWX_CONDENSE_LOG.GET_PWX_CONDENSE_LOGS_ID(
+     	             SOURCE_NAME_IN => :source_name,
+					 FILE_NAME_IN => :file_name,
+					 OPEN_TIME_IN => :open_time); 
+          END;");
+    $sth->bind_param( ':source_name', $files_to_read{$readfile}{'source_name'}, {TYPE=>SQL_VARCHAR});
+    $sth->bind_param( ':file_name', $readfile, {TYPE=>SQL_VARCHAR});
+    $sth->bind_param( ':open_time', $files_to_read{$readfile}{'open_time'}, {TYPE=>SQL_VARCHAR});
+   	$sth->bind_param_inout(":r_id", \$r_id, 9);
+   	$sth->execute();
+   };
+   if($@) {
+       $message = "GET_PWX_CONDENSE_LOGS_ID: Errors! : $@\n";
+       print $message;
+       eval 
+       { 
+	     $dbh->rollback;
+       };
+       if( $@ ) { 
+  	      $message = "GET_PWX_CONDENSE_LOGS_ID rollback: $@\n";
+	      print $message;
+       }
+	   die;
+   } 
+   eval { 
+      $dbh->commit(); 
+   };
+   if ($@ ) { 
+         my $message = "Commit GET_PWX_CONDENSE_LOGS_ID failed: $@\n";
+	         print $message;
+	         push @failed, $message;
+	   	 eval { 
+	 	     $dbh->rollback()
+		 };
+	   	 if( $@ ) {     
+	           $message = "Rollback commit GET_PWX_CONDENSE_LOGS_ID failed: $@\n";
+	           print $message;
+	         }
+	         die;
+  }
+  #(defined($verbose)) and print "r_id: $r_id";
+  
+  read_from_file( $readfile, $log_directory, $files_to_read{$readfile}{'source_name'}, $files_to_read{$readfile}{'open_time'}, $r_id );
+
+}
+# update all the logs that dont have a complete date that havent been updated in the last month.
+eval { 
+   	$sth = $dbh->prepare( 
+   	"BEGIN 
+        PKG_PWX_CONDENSE_LOG.UPDATE_CLOSE_TIME (SOURCE_NAME_IN => :source_name, TIME_PERIOD_IN  => 'M'  ); 
+   	 END;");
+   	 
+    $sth->bind_param( ':source_name', $dir_name[-1], { TYPE => SQL_VARCHAR });
+   	$sth->execute();
+};
+if($@) {
+   $message = "UPDATE_CLOSE_TIME: Errors! : $@\n";
+   print $message;
+   eval 
+   { 
+     $dbh->rollback;
+   };
+   if( $@ ) { 
+	      $message = "UPDATE_CLOSE_TIME rollback: $@\n";
+      print $message;
+   }
+   die;
+} else { 
+   eval { 
+	  $dbh->commit(); 
+   };
+   if ($@ ) { 
+	   my $message = "Commit failed: $@\n";
+	   print $message;
+	   push @failed, $message;
+	   eval { $dbh->rollback() };
+ 	   if( $@ ) {  
+	     $message = "Rollback failed: $@\n";
+	     print $message;
+	   }
+	   die;
+   }
+} 
+   
+if($dbh) { 
+ $dbh->disconnect();
+}
+# 
+sub read_from_file {
+   my( $file_name, $log_directory, $source_name, $open_time, $pwx_condense_logs_id) = @_;
+   (defined($verbose)) and print "file_name            : $file_name";
+   (defined($verbose)) and print "log_directory        : $log_directory";
+   (defined($verbose)) and print "source_name          : $source_name";
+   (defined($verbose)) and print "open_time            : $open_time";
+   (defined($verbose)) and print "pwx_condense_logs_id : $pwx_condense_logs_id";
+   
+   open(FIN,'<', $log_directory.$file_name) or die("Couldn't open the file-$log_directory.$file_name");
+   while( <FIN> ) { 
+	  my $line = $_;
+	  chomp( $line );
+      my $index_val_open  = index($line, "Trace file opened");
+      my $index_val_close  = index($line, "Trace file closed");
+      my $index_val_polls = index($line, ORACLE_LOGMINER_POLLS);
+      my $index_val_waits = index($line, ORACLE_LOGMINER_WAITS);
+      my $index_val_processing_SCN = index($line, PROCESSING_SCN);
+      my $index_val_time_diff = index($line, TIME_DIFF);
+      my $index_val_unformatted_logs = index($line, UNFORMATTED_LOGS);
+  
+      if( $index_val_open != -1) {
+           #(defined($verbose)) and print "update open time   : $open_time";
+	       eval  {
+	    	   $sth = $dbh->prepare(
+	    		"BEGIN 
+	       		     PKG_PWX_CONDENSE_LOG.UPDATE_OPEN_TIME(
+	       		     PWX_CONDENSE_LOGS_ID_IN => :pwx_condense_logs_id,
+	                 OPEN_TIME_IN =>  :open_time); 
+	   		     END;");
+	    	   $sth->bind_param( ':pwx_condense_logs_id', $pwx_condense_logs_id, { TYPE => SQL_INTEGER });
+	    	   $sth->bind_param( ':open_time', $open_time, { TYPE => SQL_VARCHAR });
+	   	       $sth->execute();
+	       };
+		   if($@) {
+		       $message = "UPDATE_OPEN_TIME: Errors! : $@\n";
+		       print $message;
+		       eval 
+		       { 
+			     $dbh->rollback;
+		       };
+		       if( $@ ) { 
+		  	      $message = "UPDATE_OPEN_TIME rollback: $@\n";
+			      print $message;
+		       }
+			   die;
+		   }
+	   	    eval {
+		      $dbh->commit(); 
+		    };
+	   	    if ($@ ) { 
+	  	       my $message = "Commit UPDATE_OPEN_TIME failed: $@\n";
+	    	   print $message;
+	    	   push @failed, $message;
+	   	       eval {
+	     		  $dbh->rollback()
+	    	   };
+	    	   if( $@ ) {  
+	     		  $message = "Rollback commit UPDATE_OPEN_TIME failed: $@\n";
+	    		  print $message;
+	    	   }
+	   	     }
+   	  } elsif( $index_val_close != -1) {
+	       my $close_date = substr($line, ($index_val_close+17));
+	       $close_date =~ s/^\s+//;
+	       $close_date =~ s/\s+$//;
+           #(defined($verbose)) and print "update close time   : $pwx_condense_logs_id";
+           #(defined($verbose)) and print "update close time   : $close_date";
+	       eval {
+	        $sth = $dbh->prepare(
+	   	           "BEGIN 
+	                  PKG_PWX_CONDENSE_LOG.UPDATE_CLOSE_TIME(
+		       		     PWX_CONDENSE_LOGS_ID_IN => :pwx_condense_logs_id,
+	 				     CLOSE_TIME_IN => :close_time); 
+	   	            END;");
+		    	   $sth->bind_param( ':pwx_condense_logs_id', $pwx_condense_logs_id, { TYPE => SQL_INTEGER });
+	  	   	       $sth->bind_param( ':close_time', $close_date, { TYPE => SQL_VARCHAR });
+	 	   	       $sth->execute();
+	       };
+	       if($@) {
+			  	$message = "UPDATE_CLOSE_TIME Errors! : $@\n";
+			   	print $message;
+		        eval {
+			  	  $dbh->rollback;
+			    };
+		   	    if( $@ ) { 
+		    	   $message = "UPDATE_CLOSE_TIME rollback: $@\n";
+		   	       print $message;
+		        }
+		        die;
+	       } else { 
+		        eval { 
+			       $dbh->commit();
+		        };
+			   	if ($@ ) { 
+			    	my $message = "UPDATE_CLOSE_TIME Commit failed: $@\n";
+			    	print $message;
+			   	    push @failed, $message;
+			    	eval {
+				      $dbh->rollback()
+				    };
+			    	if( $@ ) {  
+			     	    $message = "UPDATE_CLOSE_TIME Rollback failed: $@\n";
+			     	    print $message;
+			        }
+			        die;
+			    }
+	       }
+      } elsif($index_val_polls != -1) { 
+          #(defined($verbose)) and print "logminer_polls";
+	      my @values = split(" ", $line);
+          #(defined($verbose)) and print "logminer_polls: $values[5]";
+	      if($values[5] ne "UNKNOWN") {
+		       my $date_time = $values[0]." ".$values[1];
+               #(defined($verbose)) and print "logminer_polls: date_time: $date_time";
+	           eval{
+	     	     $sth = $dbh->prepare(
+	     	     "BEGIN 
+		       		  PKG_PWX_CONDENSE_LOG.LOGMINER_POLLS(
+		       		  DATE_TIME_IN => :date_time,
+		              PWX_CONDENSE_LOGS_ID_IN => :pwx_condense_logs_id,
+		              LOGMINER_POLLS_IN => :logminer_polls); 
+	     	      END;");
+	      	      $sth->bind_param( ':date_time', $date_time, { TYPE => SQL_VARCHAR });
+	              $sth->bind_param( ':pwx_condense_logs_id', $pwx_condense_logs_id, { TYPE => SQL_INTEGER });
+	              $sth->bind_param( ':logminer_polls', $values[5], { TYPE => SQL_VARCHAR });
+	              $sth->execute();
+	           };
+	           if($@) {
+	     	      $message = "LOGMINER_POLLS Errors! : $@\n";
+	              print $message;
+	              eval { 
+	 		        $dbh->rollback;
+		          };
+	     	      if( $@ ) { 
+		     		 $message = "LOGMINER_POLLS rollback: $@\n";
+		     		 print $message;
+	     	      }
+	     	      die;
+	           } else { 
+	     	      eval {
+			        $dbh->commit();
+		          };
+	    	      if ($@ ) { 
+		     		  my $message = "LOGMINER_POLLS Commit failed: $@\n";
+		      		  print $message;
+		     		  push @failed, $message;
+		      		  eval {
+				         $dbh->rollback() 
+				      };
+		      		  if( $@ ) {  
+		       		      $message = "Rollback failed: $@\n";
+		       		      print $message;
+		      		  }
+		      		  die;
+	              }
+	           }
+	      }
+      } elsif($index_val_waits != -1) {
+          #(defined($verbose)) and print "logminer_waits";
+	      
+          my @values = split(" ", $line);
+          #(defined($verbose)) and print "logminer_waits: $values[5]";
+          if($values[5] ne "UNKNOWN") {
+		       my $date_time = $values[0]." ".$values[1];
+               #(defined($verbose)) and print "logminer_waits: date_time: $date_time";
+	   	       eval {  
+	    		 $sth = $dbh->prepare(
+	     		 "BEGIN 
+	           	      PKG_PWX_CONDENSE_LOG.LOGMINER_WAITS(
+	           	      DATE_TIME_IN => :date_time,
+		              PWX_CONDENSE_LOGS_ID_IN => :pwx_condense_logs_id,
+	                  LOGMINER_WAITS_IN => :logminer_waits); 
+	     		  END;");
+	      		 $sth->bind_param( ':date_time', $date_time, { TYPE => SQL_VARCHAR });
+	              $sth->bind_param( ':pwx_condense_logs_id', $pwx_condense_logs_id, { TYPE => SQL_INTEGER });
+	     		 $sth->bind_param( ':logminer_waits', $values[5], { TYPE => SQL_VARCHAR });
+	     		 $sth->execute();
+    	       };
+    	       if($@) {
+  	    	  	    $message = "LOGMINER_WAITS Errors! : $@\n";
+	     		    print $message;
+		     		eval { 
+		      		    $dbh->rollback; 
+		     		};
+		    		if( $@ ) { 
+		      		    $message = "LOGMINER_WAITS rollback: $@\n";
+		     		    print $message;
+		     		}
+		     		die;
+    	       } else { 
+	     		    eval {
+			            $dbh->commit();
+			        };
+		     		if ($@ ) { 
+		      		   my $message = "Commit failed: $@\n";
+		      		   print $message;
+		      		   push @failed, $message;
+		               eval { 
+					     $dbh->rollback() 
+		  		       };
+		      		   if( $@ ) {  
+		      			 $message = "Rollback failed: $@\n";
+		     		     print $message;
+		     		   }
+		     		   die;
+		     		}
+	           } 
+  	      }
+      } elsif($index_val_time_diff != -1) { 
+          #(defined($verbose)) and print "time_differential";
+	      my $index_val = index($line, ":");
+	      my @values = split(" ", $line);
+	      my $line = substr($line, $index_val + 1);
+	      $line =~s/^\s+//;
+	      $line =~ s/\s+$//; 
+	      if($line ne "UNKNOWN") {
+   	         my $date_time = $values[0]." ".$values[1];
+             #(defined($verbose)) and print "time_differential: $date_time";
+             #(defined($verbose)) and print "time_differential: $line";
+	   	     eval {
+	     		$sth = $dbh->prepare(
+	    	           "BEGIN 
+	       		         PKG_PWX_CONDENSE_LOG.TIME_DIFFERENTIAL(
+	       		         DATE_TIME_IN => :date_time,
+		                 PWX_CONDENSE_LOGS_ID_IN => :pwx_condense_logs_id,
+	                     TIME_DIFFERENTIAL_IN => :time_diff); 
+	     	            END;");
+	    	    $sth->bind_param( ':date_time', $date_time, { TYPE => SQL_VARCHAR });
+	             $sth->bind_param( ':pwx_condense_logs_id', $pwx_condense_logs_id, { TYPE => SQL_INTEGER });
+	      		$sth->bind_param( ':time_diff', $line, { TYPE => SQL_VARCHAR });
+	      		$sth->execute();
+	     	 };
+	         if($@) {
+	    	     $message = "TIME_DIFFERENTIAL Errors! : $@\n";
+	      		 print $message;
+	      		 eval {
+			       $dbh->rollback;
+			     };
+	      		 if( $@ ) { 
+	       		    $message = "TIME_DIFFERENTIAL rollback: $@\n";
+	       		    print $message;
+	      	     }
+	      	     die;
+	         } else { 
+	     		 eval{ 
+			       $dbh->commit();
+			     };
+	      		 if ($@ ) { 
+	       		   my $message = "Commit TIME_DIFFERENTIAL failed: $@\n";
+	       		   print $message;
+	       		   push @failed, $message;
+	       		   eval {
+			         $dbh->rollback() 
+			       };
+	       		   if( $@ ) {  
+	       		      $message = "Rollback commit TIME_DIFFERENTIAL failed: $@\n";
+	                  print $message;
+	        	   }
+	        	   die;	
+	      		}
+	     	 }
+	      }
+      } elsif($index_val_processing_SCN != -1) {
+	      my @current_line_values = split(" ", $line);
+	      $current_line_values[7] =~ s/[<>.]//g; #processing scn
+	      my $values;
+	      # advance the pointer to the next line
+	      my $nextline = <FIN>;
+	      # look to see if the next line contains a < character.
+	      my $index_val = index($nextline, "<");
+	      # if the next line contains a < character, then trim spaces from the beginning and end
+	      # and trim the > and < characters.
+	      # the resulting string should be the current scn.
+	      if($index_val != -1) {
+		 	 $values=$nextline;
+		 	 chomp( $values );
+		   	 $values =~ s/^\s+//;
+		  	 $values =~ s/\s+$//;
+		   	 $values=~ s/[><]//g;	
+	      } else {
+	     	 $values = '';
+	      }
+	      if($current_line_values[7] ne "UNKNOWN" and $values ne "UNKNOWN") { 
+    	        my $date_time = $current_line_values[0]." ".$current_line_values[1];
+	    	    eval {
+	    	        $sth = $dbh->prepare(
+		     		"BEGIN 
+		       		     PKG_PWX_CONDENSE_LOG.PROCESSING_AND_CURRENT_SCN(
+		       		     DATE_TIME_IN => :date_time,
+			             PWX_CONDENSE_LOGS_ID_IN => :pwx_condense_logs_id,
+		                 PROCESSING_SCN_IN => :processing_scn,
+		       			 CURRENT_SCN_IN => :current_scn); 
+		     		END;");
+		   	        $sth->bind_param( ':date_time', $date_time, { TYPE => SQL_VARCHAR });
+		            $sth->bind_param( ':pwx_condense_logs_id', $pwx_condense_logs_id, { TYPE => SQL_INTEGER });
+		     		$sth->bind_param( ':processing_scn', $current_line_values[7], { TYPE => SQL_VARCHAR });
+		     		$sth->bind_param( ':current_scn', $values, { TYPE => SQL_VARCHAR });
+		     		$sth->execute();
+	    	   };
+		       if($@) {
+		    	   $message = "PROCESSING_AND_CURRENT_SCN Errors! : $@\n";
+		      	   print $message;
+		      	   eval {
+				       $dbh->rollback;
+				   };
+		      	   if( $@ ) { 
+		       		    $message = "PROCESSING_AND_CURRENT_SCN rollback: $@\n";
+		       		    print $message;
+		      	  }
+		      	  die;
+		       } else { 
+		     	  eval{ 
+				       $dbh->commit();
+				  };
+		      	  if ($@ ) { 
+		       		   my $message = "PROCESSING_AND_CURRENT_SCN Commit failed: $@\n";
+		       		   print $message;
+		       		   push @failed, $message;
+		       		   eval {
+				         $dbh->rollback() 
+				       };
+		       		   if( $@ ) {  
+		       		      $message = "PROCESSING_AND_CURRENT_SCN commit Rollback failed: $@\n";
+		                  print $message;
+		        	   }
+		        	   die;	
+		      	  }
+		       }
+	  	     } # end both UNKNOWN
+	         if($current_line_values[7] eq "UNKNOWN") { 
+    	       my $date_time = $current_line_values[0]." ".$current_line_values[1];
+		  	   eval {
+		   	        $sth = $dbh->prepare(
+		    		"BEGIN 
+		     		      PKG_PWX_CONDENSE_LOG.PROCESSING_SCN_UNKNOWN(
+		     		      DATE_TIME_IN => :date_time,
+			              PWX_CONDENSE_LOGS_ID_IN => :pwx_condense_logs_id,
+		                  PROCESSING_SCN_IN => :processing_scn); 
+		     		END;");
+		   	        $sth->bind_param( ':date_time', $date_time, { TYPE => SQL_VARCHAR });
+		            $sth->bind_param( ':pwx_condense_logs_id', $pwx_condense_logs_id, { TYPE => SQL_INTEGER });
+		     		$sth->bind_param( ':processing_scn', $current_line_values[7], { TYPE => SQL_VARCHAR });
+		     		$sth->execute();
+		   	   };
+		       if($@) {
+		    	     $message = "PROCESSING_SCN_UNKNOWN Errors! : $@\n";
+		      		 print $message;
+		      		 eval {
+				       $dbh->rollback;
+				     };
+		      		 if( $@ ) { 
+		       		    $message = "PROCESSING_SCN_UNKNOWN rollback: $@\n";
+		       		    print $message;
+		      	     }
+		      	     die;
+		       } else { 
+		     		 eval{ 
+				       $dbh->commit();
+				     };
+		      		 if ($@ ) { 
+		       		   my $message = "PROCESSING_SCN_UNKNOWN Commit failed: $@\n";
+		       		   print $message;
+		       		   push @failed, $message;
+		       		   eval {
+				         $dbh->rollback() 
+				       };
+		       		   if( $@ ) {  
+		       		      $message = "PROCESSING_SCN_UNKNOWN commit Rollback failed: $@\n";
+		                  print $message;
+		        	   }
+		        	   die;	
+		      		}
+		       }
+	  	     } # end current_line_values[7] unknown
+	      	 if($nextline eq "UNKNOWN") {  
+    	       my $date_time = $current_line_values[0]." ".$current_line_values[1];
+		   	   eval {
+		   	       $sth = $dbh->prepare(
+		    	       "BEGIN 
+		   		          PKG_PWX_CONDENSE_LOG.CURRENT_SCN_UNKNOWN(
+		   		          DATE_TIME_IN => :date_time,
+			              PWX_CONDENSE_LOGS_ID_IN => :pwx_condense_logs_id,
+		       			  CURRENT_SCN_IN => :current_scn); 
+		     		    END;");
+		   		   $sth->bind_param( ':date_time', $date_time, { TYPE => SQL_VARCHAR });
+		           $sth->bind_param( ':pwx_condense_logs_id', $pwx_condense_logs_id, { TYPE => SQL_INTEGER });
+		     	   $sth->bind_param( ':current_scn', $values, { TYPE => SQL_VARCHAR });
+		     	   $sth->execute();
+		   	  };
+		       if($@) {
+		    	     $message = "PROCESSING_SCN_UNKNOWN Errors! : $@\n";
+		      		 print $message;
+		      		 eval {
+				       $dbh->rollback;
+				     };
+		      		 if( $@ ) { 
+		       		    $message = "PROCESSING_SCN_UNKNOWN rollback: $@\n";
+		       		    print $message;
+		      	     }
+		      	     die;
+		       } else { 
+		     		 eval{ 
+				       $dbh->commit();
+				     };
+		      		 if ($@ ) { 
+		       		   my $message = "PROCESSING_SCN_UNKNOWN Commit failed: $@\n";
+		       		   print $message;
+		       		   push @failed, $message;
+		       		   eval {
+				         $dbh->rollback() 
+				       };
+		       		   if( $@ ) {  
+		       		      $message = "PROCESSING_SCN_UNKNOWN commit Rollback failed: $@\n";
+		                  print $message;
+		        	   }
+		        	   die;	
+		      		}
+		       }
+		   	  
+	       } # end nextline UNKNOWN
+	        
+	       if ( $index_val == -1) #current scn not found 
+	       { 
+			seek(FIN, -length($nextline), 1);
+	       }
+      } elsif($index_val_unformatted_logs != -1) {
+           #(defined($verbose)) and print "unformatted logs";
+	       #(defined($verbose)) and print "pwx_condense_logs_id : $pwx_condense_logs_id";
+ 	       my @current_line_values = split(" ", $line);
+    	   my $date_time = $current_line_values[0]." ".$current_line_values[1];
+	       eval {
+	        $sth = $dbh->prepare(
+	   	           "BEGIN 
+	                  PKG_PWX_CONDENSE_LOG.UNFORMATTED_LOGS(
+		       		     DATE_TIME_IN => :date_time,
+			             PWX_CONDENSE_LOGS_ID_IN => :pwx_condense_logs_id
+  				      ); 
+	   	            END;");
+		    	   $sth->bind_param( ':pwx_condense_logs_id', $pwx_condense_logs_id, { TYPE => SQL_INTEGER });
+		   		   $sth->bind_param( ':date_time', $date_time, { TYPE => SQL_VARCHAR });
+	 	   	       $sth->execute();
+	       };
+	       if($@) {
+			  	$message = "UNFORMATTED_LOGS Errors! : $@\n";
+			   	print $message;
+		        eval {
+			  	  $dbh->rollback;
+			    };
+		   	    if( $@ ) { 
+		    	   $message = "UNFORMATTED_LOGS rollback: $@\n";
+		   	       print $message;
+		        }
+		        die;
+	       } else { 
+		        eval { 
+			       $dbh->commit();
+		        };
+			   	if ($@ ) { 
+			    	my $message = "UNFORMATTED_LOGS Commit failed: $@\n";
+			    	print $message;
+			   	    push @failed, $message;
+			    	eval {
+				      $dbh->rollback()
+				    };
+			    	if( $@ ) {  
+			     	    $message = "UNFORMATTED_LOGS Rollback failed: $@\n";
+			     	    print $message;
+			        }
+			        die;
+			    }
+	       }
+     }
+  } #end of while loop
+  close(FIN);
+} #end of read from file
