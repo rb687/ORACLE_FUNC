@@ -1,0 +1,47 @@
+#!/usr/bin/env /siglinux/tc/bin/perl
+
+use strict; 
+use warnings;
+use Getopt::Long;
+
+my $search_word; 
+my $folder_loc;
+#my $destination_loc;
+
+my $result = GetOptions ("search_word=s"	=>\$search_word,
+			"folder_loc=s"		=>\$folder_loc,
+#			"destination_loc=s"	=>\$destination_loc,
+			);
+
+defined($search_word) or die "Search Word not specified.";
+#defined($destination_loc) or die "Destination Location not specified";
+defined($folder_loc) or die "Folder Location not specified.";
+
+print "Search Word: $search_word\n";
+print "Folder Loc:  $folder_loc\n";
+#print "Destination Loc: $destination_loc\n";
+
+opendir(my $DH, $folder_loc) or die "Error Opening Folder : $folder_loc";
+my @files_in_folder = readdir($DH);
+closedir($DH);
+
+foreach my $file (@files_in_folder) 
+{
+	my $x = 0;
+	open(FIN, '<', $folder_loc.$file) or die "Couldn't open the file: $file";
+	while ((my $line = <FIN>) && $x == '0')
+	{
+		my $index_search_word = index($line, $search_word);
+		if ($index_search_word != -1)
+		{
+			#`cp $folder_loc$file $destination_loc$file`;
+			print "$file\n";
+			$x = 1;
+			last;
+		}
+		
+	}
+	close(FIN);
+}
+
+exit 0; 
