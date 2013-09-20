@@ -1,0 +1,357 @@
+#!/usr/bin/env /siglinux/tc/bin/perl
+
+########################################################################
+# File          : pwx_log_to_database_report.pl
+#
+# Author        : Richa Bhartia
+# Date          : 04/20/2013
+# Description   : This script queries a database table containing UOW condenser logs and finds particular metrics.
+#                 It then checks the metrics against thresholds passed in by the user and alerts if the thresholds are exceeded.
+#
+# Params        : Database connect string (SID).
+#             Database user name.
+#             Database user password.
+#             log directory containing PowerExchange UOW condenser log files.
+#
+# ID        : $Id: //Depot/Source/Database/pwxadmin/Main/Scripts/pwx_log_to_database_report.pl#6 $ $Date: 2013/05/02 $ $Author: bhartia $
+#
+# Modification  : <name/date/description of any changes made after initial creation>
+#                  Name            Date              Description of Change
+#                  ----            ----              ---------------------
+#                  Richa Bhartia   04/20/2013        New.
+#
+#
+#
+##########################################################################################################################
+$\="\n";
+$|=1;
+use strict;
+use warnings;
+use Getopt::Long;
+use DBI qw(:sql_types);
+use DBD::Oracle qw(:ora_types);
+use MIME::Lite;
+
+my $dbsource;
+my $dbname;
+my $user;
+my $password;
+my $dbh;
+my $source_name;
+my $sth;
+my $message = ' ';
+my $tdiff;
+my $sdiff;
+my $interval_val;
+my $avg_tdiff; 
+my $avg_scndiff;
+my $tdiff_out = -1;  
+my $tdiff_date_out;
+my $scn_diff_out = -1; 
+my $scn_diff_date_out;
+my $avg_scn_diff_out = -1; 
+my $avg_scn_diff_date_out; 
+my $avg_tdiff_out = -1;
+my $avg_tdiff_date_out; 
+my $receiver;
+my $sender;
+
+
+my $dbattr = {
+	AutoCommit => 0,
+	PrintError => 0,
+	RaiseError => 1,
+        };
+
+my $result = GetOptions("tdiff=s"         => \$tdiff,
+			"dbname=s"        => \$dbname,
+                        "user=s"          => \$user,
+                        "password=s"      => \$password,
+			"c_sdiff=s"         => \$sdiff,
+			"interval=s"      => \$interval_val,
+			"o_source_name=s"   => \$source_name,
+			"avg_tdiff=s"     => \$avg_tdiff,
+			"v_avg_scndiff=s"   => \$avg_scndiff,
+			"receiver=s"      => \$receiver,
+			"sender=s"        => \$sender,
+                       );
+
+
+(defined($dbname)) 	or die "Please specify a Database connect string (SID).";
+(defined($user)) 	or die "Please specify a Database user name.";
+(defined($password)) 	or die "Please specify the Database password.";
+(defined($source_name)) or die "Please specify the Source Name.";
+(defined($sender)) 	or die "Please specify the sender's email address.";
+
+
+unless(defined($tdiff))
+{
+	$tdiff = 30;
+}
+
+unless(defined($sdiff) )
+{
+	$sdiff = 100;
+}
+
+unless(defined($receiver) )
+{
+	$receiver ='TechSupport-InfaAdmins@sig.com';
+}
+
+unless( defined($interval_val) )
+{
+	$interval_val = 300; #interval_val is in seconds therefore, 300 secs = 5 mins
+}
+
+unless( defined($avg_tdiff) )
+{
+	$avg_tdiff = 30;
+}
+
+unless( defined($avg_scndiff) )
+{
+	$avg_scndiff = 100;
+}
+
+if($interval_val < 0 )
+{
+	print "Interval value $interval_val is not valid\n";
+	die;
+}
+
+if($tdiff < 0 )
+{
+	print "Time Differential threshold value $tdiff is not valid\n";
+	die;
+}
+
+if($sdiff < 0) 
+{
+	print "SCN Difference threshold value $sdiff is not valid\n";
+	die;
+}
+
+if($avg_tdiff < 0) 
+{
+	print "Average Time Differential threshold value $avg_tdiff is not valid\n";
+	die;
+}
+
+if($avg_scndiff < 0) 
+{
+	print "Average SCN Difference threshold value $avg_scndiff is not valid\n";
+	die;
+}
+
+print "dbname                           :$dbname\n";
+print "user                             :$user\n";
+print "Password                         :$password\n";
+print "Source Name                      :$source_name\n";
+print "Threshold Time Differential      :$tdiff\n";
+print "Threshold AVG Time Differential  :$avg_tdiff\n";
+print "Threshold AVG SCN Difference     :$avg_scndiff\n";
+print "Threshold SCN Difference         :$sdiff\n";
+print "Interval                         :$interval_val\n";
+
+
+
+$dbsource = "DBI:Oracle:$dbname";
+print $dbsource;
+$dbh =  DBI->connect($dbsource, $user, $password, $dbattr) or die "DBI error:" . DBI->errstr();
+print "\nConnection Successful\n\n";
+
+eval
+{
+	$sth = $dbh->prepare(
+			"BEGIN
+				PKG_PWX_CONDENSE_LOG_REPORT.get_last_TDIFF( 	SOURCE_NAME_IN		=> :source_name,
+										TDIFF_THRESHOLD_IN	=> :tdiff_threshold,
+										TDIFF_OUT		=> :tdiff,
+										DATE_OUT		=> :date									
+					       				  );
+			END;");
+	$sth->bind_param( ':source_name', $source_name, { TYPE => SQL_VARCHAR });
+	$sth->bind_param( ':tdiff_threshold', $tdiff, {TYPE=>SQL_VARCHAR});
+	$sth->bind_param_inout( ':tdiff', \$tdiff_out, 38);
+	$sth->bind_param_inout( ':date', \$tdiff_date_out, 21);
+	$sth->execute();
+};
+if($@)
+{
+	print "get_last_TDIFF Errors !: $@\n";
+	eval
+	{	
+		$dbh->rollback;
+	};
+	if($@)
+	{
+		print "get_last_TDIFF rollback: $@\n";
+	}
+	die;
+}
+
+#print "Returned Time Differential : $tdiff_out		$tdiff_date_out\n";
+
+ 
+eval
+{
+	$sth = $dbh->prepare(
+			"BEGIN
+				PKG_PWX_CONDENSE_LOG_REPORT.get_last_SCNDIFF(	SOURCE_NAME_IN		=>	:source_name,
+										SCNDIFF_THRESHOLD_IN	=>	:scndiff_threshold,
+										SCNDIFF_OUT		=>	:scn_diff,
+										DATE_OUT 		=> 	:date
+									    );
+			END;");
+	$sth->bind_param( ':source_name', $source_name, { TYPE => SQL_VARCHAR });
+	$sth->bind_param( ':scndiff_threshold', $sdiff, { TYPE => SQL_VARCHAR });
+	$sth->bind_param_inout( ':scn_diff', \$scn_diff_out, 38);  
+	$sth->bind_param_inout( ':date', \$scn_diff_date_out, 21);  
+	$sth->execute();
+};
+
+if($@)
+{
+	print "get_last_SCNDIFF Error !: $@\n";
+	eval
+	{	
+		$dbh->rollback;
+	};
+	if($@)
+	{
+		print "get_last_SCNDIFF rollback: $@\n";
+	}
+	die;
+}
+#print "Returned SCN Difference : $scn_diff_out		$scn_diff_date_out\n";
+
+
+ 
+eval
+{
+	$sth = $dbh->prepare(
+			"BEGIN 
+				PKG_PWX_CONDENSE_LOG_REPORT.get_avg_scn_diff(	SOURCE_NAME_IN		=>	:source_name,
+										TIME_INTERVAL_IN	=>	:time_interval,
+										SCN_DIFF_THRESHOLD_IN	=>	:scn_diff_threshold,
+										AVG_SCN_DIFF_OUT 	=> 	:avg_scn_diff_out,
+										DATE_OUT 		=> 	:date
+									    );
+			END;");
+
+	$sth->bind_param(':source_name', $source_name, {TYPE => SQL_VARCHAR});
+	$sth->bind_param(':time_interval', $interval_val, {TYPE => SQL_VARCHAR});
+	$sth->bind_param(':scn_diff_threshold', $avg_scndiff, {TYPE => SQL_VARCHAR});
+	$sth->bind_param_inout(':avg_scn_diff_out', \$avg_scn_diff_out, 38 );
+	$sth->bind_param_inout(':date', \$avg_scn_diff_date_out, 21);
+		
+	$sth->execute;
+};
+
+if($@)
+{
+	print "get_avg_scn_diff Errors !: $@\n";
+	eval
+	{	
+		$dbh->rollback;
+	};
+	if($@)
+	{
+		print "get_avg_scn_diff rollback: $@\n";
+	}
+	die;
+}
+
+ 
+#print "Returned AVG SCN Difference : $avg_scn_diff_out		$avg_scn_diff_date_out\n";
+
+ 
+
+eval
+{
+	$sth = $dbh->prepare(
+			"BEGIN 
+				PKG_PWX_CONDENSE_LOG_REPORT.get_avg_tdiff(	SOURCE_NAME_IN		=>	:source_name,
+										TIME_INTERVAL_IN	=>	:time_interval,
+										TDIFF_THRESHOLD_IN	=>	:tdiff_threshold,
+										AVG_TDIFF_OUT 		=> 	:avg_tdiff_out,
+										DATE_OUT 		=> 	:date
+									);
+			END;");
+
+	$sth->bind_param(':source_name', $source_name, {TYPE => SQL_VARCHAR});
+	$sth->bind_param(':time_interval', $interval_val, {TYPE => SQL_VARCHAR});
+	$sth->bind_param(':tdiff_threshold', $avg_tdiff, {TYPE => SQL_VARCHAR});
+	$sth->bind_param_inout(':avg_tdiff_out', \$avg_tdiff_out, 38 );
+	$sth->bind_param_inout(':date', \$avg_tdiff_date_out, 21);
+		
+	$sth->execute;
+};
+
+if($@)
+{
+	print "get_avg_tdiff Errors !: $@\n";
+	eval
+	{	
+		$dbh->rollback;
+	};
+	if($@)
+	{
+		print "get_avg_tdiff rollback: $@\n";
+	}
+	die;
+}
+
+#print "Returned AVG Time Difference : $avg_tdiff_out		$avg_tdiff_date_out\n";
+
+					
+if($tdiff_out > -1)
+{
+	$message = $message."\n".'Time Differential of the source '.$source_name.' is:	'.$tdiff_out.'	at time		'.$tdiff_date_out."\n";
+}
+ 
+
+if($scn_diff_out > -1)
+{
+	$message = $message."\n".'SCN Difference of the source '.$source_name.' is:	'.$scn_diff_out.'	at time		'.$scn_diff_date_out."\n";
+}
+
+if(($tdiff_out > -1) or ($scn_diff_out > -1))
+{
+	my $msg = MIME::Lite->new(Subject => 'PWX Last inserted SCN Difference And Time Differential',
+				To => $receiver,
+				From => $sender,
+				Data => $message
+			 	);
+	$msg->send;
+}
+
+$message = '';
+
+if($avg_tdiff_out > -1)
+{
+	$message = $message."\n".'Average Time Differential of the source '.$source_name.' is: '.$avg_tdiff_out.'   at time	'.$avg_tdiff_date_out."\n";
+}
+ 
+
+if($avg_scn_diff_out > -1) 
+{
+	$message = $message."\n".'Average SCN Difference of the source '.$source_name.' is: '.$avg_scn_diff_out.'   at time	'.$avg_scn_diff_date_out."\n";
+}
+
+
+if(($avg_tdiff_out > -1) or ($avg_scn_diff_out > -1))
+{
+
+	my $msg_1= MIME::Lite->new(Subject => 'PWX Average SCN Difference and Time Differential',
+				To => $receiver,
+				From => $sender,
+				Data => 'Average is over a time period of '.$interval_val.' seconds '."\n".$message
+				 );
+	$msg_1->send;
+}
+if($dbh)
+{ 
+	$dbh-> disconnect();
+}   
